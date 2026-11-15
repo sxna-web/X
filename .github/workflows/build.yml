@@ -2,15 +2,13 @@ name: X Android APK Build
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
     inputs:
       source_zip:
-        description: "源码 ZIP 文件名，留空自动使用 XAndroidApp_Source.zip"
+        description: "源码 ZIP 文件名；留空时自动识别仓库根目录中的源码 ZIP"
         required: false
         type: string
         default: ""
@@ -27,7 +25,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Java
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -36,27 +34,42 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Set up Gradle
+      - name: Set up Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.9"
 
-      - name: Extract source ZIP
+      - name: Find and extract source ZIP
         shell: bash
         env:
           REQUESTED_SOURCE_ZIP: ${{ inputs.source_zip }}
         run: |
           set -euo pipefail
 
-          ZIP_NAME="${REQUESTED_SOURCE_ZIP:-XAndroidApp_Source.zip}"
-
-          if [ ! -f "$ZIP_NAME" ]; then
-            echo "指定文件不存在：$ZIP_NAME"
-            echo "仓库根目录中的 ZIP 文件："
-            find . -maxdepth 2 -type f -iname "*.zip"
-            exit 1
+          if [ -n "${REQUESTED_SOURCE_ZIP:-}" ]; then
+            ZIP_NAME="$REQUESTED_SOURCE_ZIP"
+            if [ ! -f "$ZIP_NAME" ]; then
+              echo "指定的源码 ZIP 不存在：$ZIP_NAME"
+              echo "仓库根目录中的 ZIP："
+              find . -maxdepth 1 -type f -iname '*.zip' -print
+              exit 1
+            fi
+          elif [ -f "XAndroidApp_Source_Fixed.zip" ]; then
+            ZIP_NAME="XAndroidApp_Source_Fixed.zip"
+          elif [ -f "XAndroidApp_Source.zip" ]; then
+            ZIP_NAME="XAndroidApp_Source.zip"
+          else
+            mapfile -t ZIP_FILES < <(find . -maxdepth 1 -type f -iname '*.zip' -print | sort)
+            if [ "${#ZIP_FILES[@]}" -eq 1 ]; then
+              ZIP_NAME="${ZIP_FILES[0]}"
+            else
+              echo "无法自动确定源码 ZIP。请确保根目录只有一个源码 ZIP，或在手动运行时填写文件名。"
+              printf '%s\n' "${ZIP_FILES[@]}"
+              exit 1
+            fi
           fi
 
+          echo "使用源码：$ZIP_NAME"
           mkdir -p "$RUNNER_TEMP/android-source"
           unzip -q "$ZIP_NAME" -d "$RUNNER_TEMP/android-source"
 
@@ -65,58 +78,25 @@ jobs:
             -print -quit | xargs -r dirname)"
 
           if [ -z "$PROJECT_DIR" ]; then
-            echo "ZIP 中没有找到 Gradle Android 项目。"
+            echo "源码 ZIP 中没有找到 settings.gradle 或 settings.gradle.kts"
+            exit 1
+          fi
+
+          if [ ! -f "$PROJECT_DIR/app/build.gradle" ] && \
+             [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ]; then
+            echo "没有找到 app 模块的 build.gradle 或 build.gradle.kts"
             exit 1
           fi
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "项目目录：$PROJECT_DIR"
+          echo "Android 项目目录：$PROJECT_DIR"
 
-          if [ ! -f "$PROJECT_DIR/app/build.gradle" ] && \
-             [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ]; then
-            echo "没有找到 app 模块的构建文件。"
-            exit 1
-          fi
-
-      - name: Install Android SDK platform
+      - name: Install Android SDK 35
         shell: bash
         run: |
           set -euo pipefail
-
-          COMPILE_SDK="$(
-            python3 - "$PROJECT_DIR" <<'PY'
-          import pathlib
-          import re
-          import sys
-
-          root = pathlib.Path(sys.argv[1])
-          patterns = [
-              r'compileSdk(?:Version)?\s*=\s*(\d+)',
-              r'compileSdkVersion\s+(\d+)',
-              r'compileSdk\s*\(\s*(\d+)\s*\)'
-          ]
-
-          for file in root.rglob("*.gradle*"):
-              if ".gradle" in file.parts:
-                  continue
-              try:
-                  content = file.read_text(errors="ignore")
-              except Exception:
-                  continue
-              for pattern in patterns:
-                  match = re.search(pattern, content)
-                  if match:
-                      print(match.group(1))
-                      sys.exit(0)
-
-          print("35")
-          PY
-          )"
-
-          echo "使用 Android SDK 平台：$COMPILE_SDK"
-
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager "platform-tools" "platforms;android-${COMPILE_SDK}"
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
       - name: Build Debug APK
         shell: bash
@@ -131,34 +111,28 @@ jobs:
             gradle --no-daemon --stacktrace :app:assembleDebug
           fi
 
-      - name: Collect APK files
+      - name: Collect APK
         if: always()
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/apk-output"
 
-          if [ -d "$PROJECT_DIR" ]; then
-            find "$PROJECT_DIR" -type f -name "*.apk" \
-              -not -path "*/.gradle/*" \
+          if [ -d "${PROJECT_DIR:-}" ]; then
+            find "$PROJECT_DIR" -type f -name '*.apk' \
+              -not -path '*/.gradle/*' \
               -exec cp -f {} "$RUNNER_TEMP/apk-output/" \; || true
           fi
 
-          APK_COUNT="$(find "$RUNNER_TEMP/apk-output" -maxdepth 1 \
-            -type f -name "*.apk" | wc -l | tr -d ' ')"
-
-          echo "找到 APK 数量：$APK_COUNT"
-
-          if [ "$APK_COUNT" -gt 0 ]; then
-            for APK in "$RUNNER_TEMP"/apk-output/*.apk; do
-              [ -f "$APK" ] || continue
-              echo "APK：$(basename "$APK")"
-              du -h "$APK"
-            done
+          echo "本次找到的 APK："
+          find "$RUNNER_TEMP/apk-output" -maxdepth 1 -type f -name '*.apk' -print
+          if compgen -G "$RUNNER_TEMP/apk-output/*.apk" > /dev/null; then
+            du -h "$RUNNER_TEMP"/apk-output/*.apk
           else
-            echo "本次没有找到 APK，请查看前面的编译日志。"
+            echo "没有生成 APK；请查看 Build Debug APK 步骤中的首条错误。"
           fi
 
-      - name: Upload APK
+      - name: Upload APK artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
