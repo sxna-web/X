@@ -1,64 +1,168 @@
-
-name: Build Android APK
+name: X Android APK Build
 
 on:
   push:
     branches:
       - main
-      - master
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
+    inputs:
+      source_zip:
+        description: "源码 ZIP 文件名，留空自动使用 XAndroidApp_Source.zip"
+        required: false
+        type: string
+        default: ""
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
+    name: Build Android APK
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract source ZIP
-        run: |
-          mkdir -p source
-          unzip -q XAndroidApp_Source.zip -d source
-          PROJECT_DIR=$(find source -name settings.gradle.kts -printf '%h\n' | head -n 1)
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "Cannot find settings.gradle.kts in ZIP"
-            exit 1
-          fi
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.9'
+          gradle-version: "8.9"
 
-      - name: Build APK
+      - name: Extract source ZIP
+        shell: bash
+        env:
+          REQUESTED_SOURCE_ZIP: ${{ inputs.source_zip }}
         run: |
-          gradle -p "$PROJECT_DIR" assembleRelease
+          set -euo pipefail
 
-      - name: Prepare APK
+          ZIP_NAME="${REQUESTED_SOURCE_ZIP:-XAndroidApp_Source.zip}"
+
+          if [ ! -f "$ZIP_NAME" ]; then
+            echo "指定文件不存在：$ZIP_NAME"
+            echo "仓库根目录中的 ZIP 文件："
+            find . -maxdepth 2 -type f -iname "*.zip"
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/android-source"
+          unzip -q "$ZIP_NAME" -d "$RUNNER_TEMP/android-source"
+
+          PROJECT_DIR="$(find "$RUNNER_TEMP/android-source" \
+            -type f \( -name settings.gradle -o -name settings.gradle.kts \) \
+            -print -quit | xargs -r dirname)"
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ZIP 中没有找到 Gradle Android 项目。"
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "项目目录：$PROJECT_DIR"
+
+          if [ ! -f "$PROJECT_DIR/app/build.gradle" ] && \
+             [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ]; then
+            echo "没有找到 app 模块的构建文件。"
+            exit 1
+          fi
+
+      - name: Install Android SDK platform
+        shell: bash
         run: |
-          mkdir -p output
-          find "$PROJECT_DIR" -type f -name '*.apk' -exec cp {} output/ \;
-          test -n "$(find output -name '*.apk' -print -quit)"
-          ls -lh output/
+          set -euo pipefail
 
-      - name: Publish APK
-        uses: softprops/action-gh-release@v2
+          COMPILE_SDK="$(
+            python3 - "$PROJECT_DIR" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          patterns = [
+              r'compileSdk(?:Version)?\s*=\s*(\d+)',
+              r'compileSdkVersion\s+(\d+)',
+              r'compileSdk\s*\(\s*(\d+)\s*\)'
+          ]
+
+          for file in root.rglob("*.gradle*"):
+              if ".gradle" in file.parts:
+                  continue
+              try:
+                  content = file.read_text(errors="ignore")
+              except Exception:
+                  continue
+              for pattern in patterns:
+                  match = re.search(pattern, content)
+                  if match:
+                      print(match.group(1))
+                      sys.exit(0)
+
+          print("35")
+          PY
+          )"
+
+          echo "使用 Android SDK 平台：$COMPILE_SDK"
+
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-${COMPILE_SDK}"
+
+      - name: Build Debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew --no-daemon --stacktrace :app:assembleDebug
+          else
+            gradle --no-daemon --stacktrace :app:assembleDebug
+          fi
+
+      - name: Collect APK files
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/apk-output"
+
+          if [ -d "$PROJECT_DIR" ]; then
+            find "$PROJECT_DIR" -type f -name "*.apk" \
+              -not -path "*/.gradle/*" \
+              -exec cp -f {} "$RUNNER_TEMP/apk-output/" \; || true
+          fi
+
+          APK_COUNT="$(find "$RUNNER_TEMP/apk-output" -maxdepth 1 \
+            -type f -name "*.apk" | wc -l | tr -d ' ')"
+
+          echo "找到 APK 数量：$APK_COUNT"
+
+          if [ "$APK_COUNT" -gt 0 ]; then
+            for APK in "$RUNNER_TEMP"/apk-output/*.apk; do
+              [ -f "$APK" ] || continue
+              echo "APK：$(basename "$APK")"
+              du -h "$APK"
+            done
+          else
+            echo "本次没有找到 APK，请查看前面的编译日志。"
+          fi
+
+      - name: Upload APK
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: build-${{ github.run_number }}
-          name: Android APK Build ${{ github.run_number }}
-          files: output/*.apk
-          make_latest: true
+          name: X-Android-APK-${{ github.run_number }}
+          path: ${{ runner.temp }}/apk-output/*.apk
+          if-no-files-found: warn
+          retention-days: 14
