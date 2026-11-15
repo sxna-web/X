@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       source_zip:
-        description: "源码 ZIP 文件名；留空时自动选择 Fixed_v5 版本"
+        description: "源码 ZIP 文件名；留空时自动选择仓库根目录中的 ZIP"
         required: false
         type: string
         default: ""
@@ -19,8 +19,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -39,54 +38,106 @@ jobs:
         with:
           gradle-version: '8.9'
 
-      - name: Select and extract source ZIP
+      - name: Find and extract Android source (supports nested ZIP)
         shell: bash
         env:
-          REQUESTED_SOURCE_ZIP: ${{ github.event.inputs.source_zip }}
+          REQUESTED_SOURCE_ZIP: ${{ inputs.source_zip }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/android-source"
           if [[ -n "${REQUESTED_SOURCE_ZIP:-}" ]]; then
+            [[ -f "$REQUESTED_SOURCE_ZIP" ]] || { echo "指定的 ZIP 不存在：$REQUESTED_SOURCE_ZIP"; exit 1; }
             SOURCE_ZIP="$REQUESTED_SOURCE_ZIP"
-          elif [[ -f "XAndroidApp_Source_Fixed_v5.zip" ]]; then
-            SOURCE_ZIP="XAndroidApp_Source_Fixed_v5.zip"
-          elif [[ -f "XAndroidApp_Source_Fixed_v4.zip" ]]; then
-            SOURCE_ZIP="XAndroidApp_Source_Fixed_v4.zip"
-          elif [[ -f "XAndroidApp_Source_Fixed_v3.zip" ]]; then
-            SOURCE_ZIP="XAndroidApp_Source_Fixed_v3.zip"
-          elif [[ -f "XAndroidApp_Source_Fixed_v2.zip" ]]; then
-            SOURCE_ZIP="XAndroidApp_Source_Fixed_v2.zip"
-          elif [[ -f "XAndroidApp_Source_Fixed.zip" ]]; then
-            SOURCE_ZIP="XAndroidApp_Source_Fixed.zip"
-          elif [[ -f "XAndroidApp_Source.zip" ]]; then
-            SOURCE_ZIP="XAndroidApp_Source.zip"
           else
-            mapfile -t ZIP_FILES < <(find . -maxdepth 1 -type f -name '*.zip' -printf '%f\n' | sort)
-            if [[ ${#ZIP_FILES[@]} -eq 1 ]]; then
-              SOURCE_ZIP="${ZIP_FILES[0]}"
-            else
-              echo "未找到可用源码 ZIP，或根目录存在多个 ZIP。请上传 XAndroidApp_Source_Fixed_v5.zip。"
+            mapfile -t ZIP_FILES < <(find . -maxdepth 1 -type f -iname '*.zip' -printf '%f\n' | sort)
+            if [[ ${#ZIP_FILES[@]} -eq 0 ]]; then
+              echo "仓库根目录没有 ZIP 文件。请上传源码 ZIP，或上传包含源码 ZIP 的轻量包。"
               exit 1
             fi
-          fi
-          if [[ ! -f "$SOURCE_ZIP" ]]; then
-            echo "指定的源码 ZIP 不存在：$SOURCE_ZIP"
-            exit 1
+            # Prefer the explicitly named Android source archive when present.
+            SOURCE_ZIP=""
+            for candidate in XAndroidApp_Source_Fixed_v6.zip XAndroidApp_Source_Fixed_v5.zip XAndroidApp_Source_Fixed_v4.zip XAndroidApp_Source_Fixed_v3.zip; do
+              if [[ -f "$candidate" ]]; then SOURCE_ZIP="$candidate"; break; fi
+            done
+            if [[ -z "$SOURCE_ZIP" ]]; then SOURCE_ZIP="${ZIP_FILES[0]}"; fi
           fi
           echo "使用源码：$SOURCE_ZIP"
-          unzip -q "$SOURCE_ZIP" -d "$RUNNER_TEMP/android-source"
-          SOURCE_DIR="$RUNNER_TEMP/android-source"
-          SETTINGS_FILE="$(find "$SOURCE_DIR" -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)"
-          if [[ -z "$SETTINGS_FILE" ]]; then
-            echo "源码 ZIP 中找不到 settings.gradle 或 settings.gradle.kts"
-            exit 1
-          fi
-          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
-          if [[ ! -d "$PROJECT_DIR/app" ]]; then
-            echo "源码项目中找不到 app 模块：$PROJECT_DIR"
-            exit 1
-          fi
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          python3 - "$SOURCE_ZIP" "$RUNNER_TEMP/android-source" <<'PY'
+          import sys, zipfile, pathlib, tempfile, shutil
+          source=pathlib.Path(sys.argv[1]).resolve()
+          out=pathlib.Path(sys.argv[2]).resolve()
+          seen=set()
+          def safe_extract(zf, dest):
+              for info in zf.infolist():
+                  target=(dest/info.filename).resolve()
+                  if target != dest and dest not in target.parents:
+                      raise RuntimeError('ZIP 中存在非法路径：'+info.filename)
+              zf.extractall(dest)
+          def locate(root):
+              settings=list(root.rglob('settings.gradle'))+list(root.rglob('settings.gradle.kts'))
+              for f in settings:
+                  if (f.parent/'app').is_dir(): return f.parent
+              return None
+          def unpack(archive, depth=0):
+              if depth>4: return None
+              key=str(archive.resolve())
+              if key in seen: return None
+              seen.add(key)
+              stage=out if depth==0 else pathlib.Path(tempfile.mkdtemp(prefix='nested-src-'))
+              with zipfile.ZipFile(archive) as z:
+                  safe_extract(z, stage)
+              project=locate(stage)
+              if project: return project
+              for nested in stage.rglob('*.zip'):
+                  found=unpack(nested, depth+1)
+                  if found: return found
+              return None
+          project=unpack(source)
+          if project is None:
+              raise SystemExit('源码 ZIP（含嵌套 ZIP）中找不到 settings.gradle/settings.gradle.kts 和 app 模块')
+          print('Android 项目目录：', project)
+          with open(pathlib.Path.home()/'.gradle-project-dir','w') as f: f.write(str(project))
+          with open(__import__('os').environ['GITHUB_ENV'],'a') as f: f.write('PROJECT_DIR='+str(project)+'\n')
+          PY
+
+      - name: Download licensed font assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          FONT_DIR="$PROJECT_DIR/app/src/main/assets/fonts"
+          LICENSE_DIR="$FONT_DIR/licenses"
+          mkdir -p "$FONT_DIR" "$LICENSE_DIR"
+          fetch() {
+            local url="$1" out="$2"
+            echo "下载字体：$(basename "$out")"
+            curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 "$url" -o "$out"
+            test -s "$out"
+          }
+          CJK_COMMIT="523d033d6cb47f4a80c58a35753646f5c3608a78"
+          fetch "https://raw.githubusercontent.com/notofonts/noto-cjk/${CJK_COMMIT}/Sans/SubsetOTF/SC/NotoSansSC-Regular.otf" "$FONT_DIR/NotoSansSC-Regular.otf"
+          fetch "https://raw.githubusercontent.com/notofonts/noto-cjk/${CJK_COMMIT}/Sans/SubsetOTF/SC/NotoSansSC-Bold.otf" "$FONT_DIR/NotoSansSC-Bold.otf"
+          fetch "https://raw.githubusercontent.com/notofonts/noto-cjk/${CJK_COMMIT}/Sans/Mono/NotoSansMonoCJKsc-Regular.otf" "$FONT_DIR/NotoSansMonoSC-Regular.otf"
+          fetch "https://raw.githubusercontent.com/notofonts/noto-cjk/${CJK_COMMIT}/Sans/SubsetOTF/JP/NotoSansJP-Regular.otf" "$FONT_DIR/NotoSansJP-Regular.otf"
+          fetch "https://raw.githubusercontent.com/notofonts/noto-cjk/${CJK_COMMIT}/Sans/SubsetOTF/KR/NotoSansKR-Regular.otf" "$FONT_DIR/NotoSansKR-Regular.otf"
+          INTER_ZIP="$RUNNER_TEMP/inter-fonts.zip"
+          fetch "https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip" "$INTER_ZIP"
+          mkdir -p "$RUNNER_TEMP/inter-fonts"
+          unzip -oq "$INTER_ZIP" 'extras/ttf/Inter-Regular.ttf' 'extras/ttf/Inter-SemiBold.ttf' -d "$RUNNER_TEMP/inter-fonts"
+          cp "$RUNNER_TEMP/inter-fonts/extras/ttf/Inter-Regular.ttf" "$FONT_DIR/Inter-Regular.ttf"
+          cp "$RUNNER_TEMP/inter-fonts/extras/ttf/Inter-SemiBold.ttf" "$FONT_DIR/Inter-SemiBold.ttf"
+          GOOGLE_FONTS="https://raw.githubusercontent.com/google/fonts/main/ofl"
+          fetch "$GOOGLE_FONTS/notonaskharabic/NotoNaskhArabic%5Bwght%5D.ttf" "$FONT_DIR/NotoNaskhArabic-Regular.ttf"
+          fetch "$GOOGLE_FONTS/notosansthai/NotoSansThai%5Bwdth%2Cwght%5D.ttf" "$FONT_DIR/NotoSansThai-Regular.ttf"
+          fetch "$GOOGLE_FONTS/notosansdevanagari/NotoSansDevanagari%5Bwdth%2Cwght%5D.ttf" "$FONT_DIR/NotoSansDevanagari-Regular.ttf"
+          fetch "$GOOGLE_FONTS/notosanshebrew/NotoSansHebrew%5Bwght%5D.ttf" "$FONT_DIR/NotoSansHebrew-Regular.ttf"
+          fetch "$GOOGLE_FONTS/notosansbengali/NotoSansBengali%5Bwdth%2Cwght%5D.ttf" "$FONT_DIR/NotoSansBengali-Regular.ttf"
+          fetch "https://raw.githubusercontent.com/notofonts/noto-cjk/${CJK_COMMIT}/LICENSE" "$LICENSE_DIR/Noto-CJK-Copyright.txt"
+          fetch "https://raw.githubusercontent.com/google/fonts/main/ofl/inter/OFL.txt" "$LICENSE_DIR/Inter-OFL.txt"
+          for family in notonaskharabic notosansthai notosansdevanagari notosanshebrew notosansbengali; do
+            fetch "$GOOGLE_FONTS/$family/OFL.txt" "$LICENSE_DIR/${family}-OFL.txt"
+          done
+          echo "字体下载完成：$(find "$FONT_DIR" -maxdepth 1 -type f | wc -l) 个字体文件"
+          du -sh "$FONT_DIR"
 
       - name: Install Android SDK components
         run: |
@@ -110,8 +161,9 @@ jobs:
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/apk-output"
-          find "$RUNNER_TEMP/android-source" -type f -name '*.apk' -path '*/build/outputs/apk/*' -exec cp -v {} "$RUNNER_TEMP/apk-output/" \; 2>/dev/null || true
-          find . -maxdepth 5 -type f -name '*.apk' -path '*/build/outputs/apk/*' -exec cp -v {} "$RUNNER_TEMP/apk-output/" \; 2>/dev/null || true
+          if [[ -n "${PROJECT_DIR:-}" && -d "$PROJECT_DIR" ]]; then
+            find "$PROJECT_DIR" -type f -name '*.apk' -path '*/build/outputs/apk/*' -exec cp -v {} "$RUNNER_TEMP/apk-output/" \; 2>/dev/null || true
+          fi
           ls -lah "$RUNNER_TEMP/apk-output" || true
 
       - name: Upload APK artifact
