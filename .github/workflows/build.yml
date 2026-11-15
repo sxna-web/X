@@ -129,7 +129,7 @@ jobs:
           fetch "$GOOGLE_FONTS/notonaskharabic/NotoNaskhArabic%5Bwght%5D.ttf" "$FONT_DIR/NotoNaskhArabic-Regular.ttf"
           fetch "$GOOGLE_FONTS/notosansthai/NotoSansThai%5Bwdth%2Cwght%5D.ttf" "$FONT_DIR/NotoSansThai-Regular.ttf"
           fetch "$GOOGLE_FONTS/notosansdevanagari/NotoSansDevanagari%5Bwdth%2Cwght%5D.ttf" "$FONT_DIR/NotoSansDevanagari-Regular.ttf"
-          fetch "$GOOGLE_FONTS/notosanshebrew/NotoSansHebrew%5Bwght%5D.ttf" "$FONT_DIR/NotoSansHebrew-Regular.ttf"
+          fetch "$GOOGLE_FONTS/notosanshebrew/NotoSansHebrew%5Bwdth%2Cwght%5D.ttf" "$FONT_DIR/NotoSansHebrew-Regular.ttf"
           fetch "$GOOGLE_FONTS/notosansbengali/NotoSansBengali%5Bwdth%2Cwght%5D.ttf" "$FONT_DIR/NotoSansBengali-Regular.ttf"
           fetch "https://raw.githubusercontent.com/notofonts/noto-cjk/${CJK_COMMIT}/LICENSE" "$LICENSE_DIR/Noto-CJK-Copyright.txt"
           fetch "https://raw.githubusercontent.com/google/fonts/main/ofl/inter/OFL.txt" "$LICENSE_DIR/Inter-OFL.txt"
