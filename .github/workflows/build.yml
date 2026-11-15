@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       source_zip:
-        description: "源码 ZIP 文件名；留空时自动选择 Fixed_v2 版本"
+        description: "源码 ZIP 文件名；留空时自动选择 Fixed_v6 版本"
         required: false
         type: string
         default: ""
@@ -48,6 +48,14 @@ jobs:
           mkdir -p "$RUNNER_TEMP/android-source"
           if [[ -n "${REQUESTED_SOURCE_ZIP:-}" ]]; then
             SOURCE_ZIP="$REQUESTED_SOURCE_ZIP"
+          elif [[ -f "XAndroidApp_Source_Fixed_v6.zip" ]]; then
+            SOURCE_ZIP="XAndroidApp_Source_Fixed_v6.zip"
+          elif [[ -f "XAndroidApp_Source_Fixed_v5.zip" ]]; then
+            SOURCE_ZIP="XAndroidApp_Source_Fixed_v5.zip"
+          elif [[ -f "XAndroidApp_Source_Fixed_v4.zip" ]]; then
+            SOURCE_ZIP="XAndroidApp_Source_Fixed_v4.zip"
+          elif [[ -f "XAndroidApp_Source_Fixed_v3.zip" ]]; then
+            SOURCE_ZIP="XAndroidApp_Source_Fixed_v3.zip"
           elif [[ -f "XAndroidApp_Source_Fixed_v2.zip" ]]; then
             SOURCE_ZIP="XAndroidApp_Source_Fixed_v2.zip"
           elif [[ -f "XAndroidApp_Source_Fixed.zip" ]]; then
@@ -59,7 +67,7 @@ jobs:
             if [[ ${#ZIP_FILES[@]} -eq 1 ]]; then
               SOURCE_ZIP="${ZIP_FILES[0]}"
             else
-              echo "未找到可用源码 ZIP，或根目录存在多个 ZIP。请上传 XAndroidApp_Source_Fixed_v2.zip。"
+              echo "未找到可用源码 ZIP，或根目录存在多个 ZIP。请上传 XAndroidApp_Source_Fixed_v6.zip。"
               exit 1
             fi
           fi
